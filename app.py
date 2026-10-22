@@ -14,6 +14,7 @@ import json, os, re, sqlite3, time, uuid, hashlib, threading
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
+from starlette.concurrency import run_in_threadpool
 import httpx
 
 DB = os.environ.get("DB_PATH", "state.db")
@@ -104,7 +105,7 @@ def debug_responses(n: int = 20):
 def reply(obj, status=200, path=""):
     with db() as c:
         c.execute("INSERT INTO resplog VALUES(?,?,?,?)", (time.time(), path, status, json.dumps(obj)[:20000]))
-    return JSONResponse(obj, status_code=status, media_type="application/json")
+    return JSONResponse(obj, status_code=status, media_type="application/a2a+json")
 
 
 def rest_error(status, reason, msg, path=""):
@@ -381,12 +382,18 @@ def send_message(body):
             fresh = True
         else:
             t, fresh = existing, False
-    if fresh or t["status"]["state"] == "TASK_STATE_WORKING":
+    if fresh:
         if cfg.get("returnImmediately"):
-            if fresh:
-                threading.Thread(target=process, args=(t["id"],), daemon=True).start()
+            threading.Thread(target=process, args=(t["id"],), daemon=True).start()
         else:
             process(t["id"])
+    elif t["status"]["state"] == "TASK_STATE_WORKING" and not cfg.get("returnImmediately"):
+        # A retry of an in-flight request: wait for the original run, never re-execute
+        for _ in range(240):
+            time.sleep(0.5)
+            cur = load_task(t["id"])
+            if cur["status"]["state"] != "TASK_STATE_WORKING":
+                break
     t = load_task(t["id"])
     hl = cfg.get("historyLength")
     if isinstance(hl, int) and hl >= 0:
@@ -403,7 +410,7 @@ async def rest_send(request: Request):
         body = await request.json()
     except Exception:
         return rest_error(400, "INVALID_JSON", "Body must be JSON", "message:send")
-    t, err = send_message(body)
+    t, err = await run_in_threadpool(send_message, body)
     if err:
         return rest_error(400, "INVALID_ARGUMENT", err, "message:send")
     return reply({"task": t}, 200, "message:send")
@@ -476,7 +483,7 @@ async def jsonrpc(request: Request):
     ok = lambda r: reply({"jsonrpc": "2.0", "id": rid, "result": r}, 200, "rpc")
     err = lambda c, s: reply({"jsonrpc": "2.0", "id": rid, "error": {"code": c, "message": s}}, 200, "rpc")
     if m in ("SendMessage", "message/send"):
-        t, e = send_message(params)
+        t, e = await run_in_threadpool(send_message, params)
         return err(-32602, e) if e else ok({"task": t})
     if m in ("GetTask", "tasks/get"):
         t = load_task(params.get("id", ""))
