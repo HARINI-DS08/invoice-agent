@@ -465,7 +465,8 @@ def build_proposals(task_id, batch):
     results = list(POOL.map(decide, pkgs))
     props = []
     for p, d in results:
-        prop = {"proposalId": "prop_" + hashlib.sha256(f"{task_id}|{p['packageId']}".encode()).hexdigest()[:16],
+        aid = "act_" + hashlib.sha256(f"{task_id}|{p['packageId']}".encode()).hexdigest()[:20]
+        prop = {"actionId": aid, "proposalId": aid,
                 "packageId": p["packageId"], "supplier": p["supplier"], "invoiceNumber": p["invoiceNumber"],
                 "amount": p["amount"], "currency": p["currency"], "action": d["action"],
                 "evidence": d["evidence"], "evidenceIds": d["evidence"], "reason": d.get("reason", ""),
@@ -512,6 +513,86 @@ def run_proposals(task_id, batch):
         save_task(t)
 
 
+SUCCESS = re.compile(r"^(EXECUTED|SUCCEEDED|SUCCESS|COMPLETED|DONE|APPLIED|APPROVED|ACCEPTED|OK|PAID|SETTLED)$", re.I)
+
+
+def find_results(msg):
+    for part in msg.get("parts", []) or []:
+        d = part.get("data")
+        if isinstance(d, dict) and isinstance(d.get("results"), list):
+            return d
+    return None
+
+
+def handle_results(principal, t, msg, props, data):
+    """Bind execution results (with receipt nonces) to our proposed actions. Strict validation."""
+    batch_id = t["artifacts"][0]["parts"][0]["data"].get("batchId")
+    if data.get("batchId") and batch_id and data["batchId"] != batch_id:
+        return None, err(400, "INVALID_CONTINUATION", "batchId does not match the task")
+    by_aid = {p["actionId"]: p for p in props}
+    by_pkg = {p["packageId"]: p for p in props}
+    seen, bound = set(), []
+    if not data["results"]:
+        return None, err(400, "INVALID_CONTINUATION", "results is empty")
+    for i, r in enumerate(data["results"]):
+        if not isinstance(r, dict):
+            return None, err(400, "INVALID_CONTINUATION", f"results[{i}] is not an object")
+        aid, pkg = r.get("actionId"), r.get("packageId")
+        p = by_aid.get(aid) if aid is not None else by_pkg.get(pkg)
+        if p is None:
+            return None, err(400, "INVALID_CONTINUATION", f"results[{i}] references unknown action {aid or pkg}")
+        if pkg is not None and pkg != p["packageId"]:
+            return None, err(400, "INVALID_CONTINUATION", f"results[{i}] packageId does not match action")
+        if r.get("action") is not None and r["action"] != p["action"]:
+            return None, err(400, "INVALID_CONTINUATION", f"results[{i}] action differs from the proposed action")
+        nonce = r.get("receiptNonce")
+        if not isinstance(nonce, str) or not nonce.strip():
+            return None, err(400, "INVALID_CONTINUATION", f"results[{i}] is missing receiptNonce")
+        if not isinstance(r.get("outcome"), str) or not r["outcome"].strip():
+            return None, err(400, "INVALID_CONTINUATION", f"results[{i}] is missing outcome")
+        if p["actionId"] in seen:
+            return None, err(400, "INVALID_CONTINUATION", f"results[{i}] duplicates action {p['actionId']}")
+        seen.add(p["actionId"])
+        bound.append((p, r))
+    receipts = []
+    for p, r in bound:
+        ok = bool(SUCCESS.match(r["outcome"].strip()))
+        rec = {"receiptId": "rcpt_" + hashlib.sha256(f"{t['id']}|{p['actionId']}|{r['receiptNonce']}".encode()).hexdigest()[:20],
+               "receiptNonce": r["receiptNonce"], "actionId": p["actionId"], "packageId": p["packageId"],
+               "action": p["action"], "outcome": r["outcome"], "taskId": t["id"], "contextId": t["contextId"],
+               "batchId": batch_id, "resultMessageId": msg.get("messageId"), "invoiceNumber": p["invoiceNumber"],
+               "supplier": p["supplier"], "amount": p["amount"], "currency": p["currency"],
+               "evidence": p["evidence"], "proposalHash": p["proposalHash"], "recordedAt": now()}
+        if p["action"] == PAY and ok:
+            key = pay_key(p)
+            with db() as c:
+                row = c.execute("SELECT receipt FROM pays3 WHERE key=?", (key,)).fetchone()
+                if row:
+                    rec["duplicatePaymentPrevented"] = True
+                    rec["originalReceiptNonce"] = json.loads(row[0]).get("receiptNonce")
+                else:
+                    c.execute("INSERT INTO pays3 VALUES(?,?)", (key, json.dumps(rec)))
+            rec["idempotencyKey"] = key
+        p["status"] = "executed" if ok else r["outcome"].lower()
+        receipts.append(rec)
+    for p in props:
+        if p["actionId"] not in seen:
+            p["status"] = "no_result"
+    t["history"].append({**msg, "role": msg.get("role") or "ROLE_USER", "contextId": t["contextId"]})
+    t["artifacts"][0]["parts"][0]["data"]["proposals"] = props
+    t["artifacts"] = t["artifacts"][:1] + [{
+        "artifactId": "receipts_" + t["id"], "name": "invoice-action-receipts",
+        "description": "Receipts bound to taskId, actionId and the receiptNonce reported for each action.",
+        "parts": [{"data": {"batchId": batch_id, "taskId": t["id"], "resultMessageId": msg.get("messageId"),
+                            "receipts": receipts}, "mediaType": RECEIPTS_MT}]}]
+    m = agent_msg(f"Recorded {len(receipts)} receipt(s) for {len(props)} proposed action(s).", t["id"],
+                  t["contextId"], {"receiptNonces": [r["receiptNonce"] for r in receipts]})
+    t["status"] = {"state": "TASK_STATE_COMPLETED", "timestamp": now(), "message": m}
+    t["history"].append(m)
+    save_task(t)
+    return t, None
+
+
 def continue_task(principal, t, msg):
     with LOCK:
         t = load_task(t["id"], principal)
@@ -520,6 +601,9 @@ def continue_task(principal, t, msg):
         if msg.get("contextId") and msg["contextId"] != t["contextId"]:
             return None, err(400, "INVALID_CONTINUATION", "contextId does not match the task")
         props = t["artifacts"][0]["parts"][0]["data"]["proposals"]
+        results = find_results(msg)
+        if results is not None:
+            return handle_results(principal, t, msg, props, results)
         approved, rejected, e = parse_approvals(msg, props)
         if e:
             return None, err(400, "INVALID_CONTINUATION", e)
@@ -681,4 +765,4 @@ def rest_cancel(request: Request, rest: str):
 @app.get("/a2a")
 @app.get("/a2a/")
 def root():
-    return JSONResponse({"ok": True, "version": 4, "agentCard": "/.well-known/agent-card.json", "a2aBase": BASE})
+    return JSONResponse({"ok": True, "version": 5, "agentCard": "/.well-known/agent-card.json", "a2aBase": BASE})
