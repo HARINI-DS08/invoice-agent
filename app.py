@@ -124,7 +124,8 @@ async def mw(request: Request, call_next):
 
 
 @app.get("/debug/summary", response_class=PlainTextResponse)
-def debug_summary(n: int = 80, skip: int = 0):
+@app.get("/debug/s/{nonce}", response_class=PlainTextResponse)
+def debug_summary(n: int = 80, skip: int = 0, nonce: str = ""):
     with db() as c:
         rows = c.execute("SELECT ts,method,path,status,info FROM log3 ORDER BY ts DESC LIMIT ? OFFSET ?",
                          (n, skip)).fetchall()
@@ -288,7 +289,7 @@ def llm_action(p):
         return None
     listing = "\n".join(f"{i}: {s}" for i, s in p["evidence"])
     try:
-        r = httpx.post(LLM_URL, headers={"Authorization": f"Bearer {LLM_KEY}"}, timeout=40, json={
+        r = httpx.post(LLM_URL, headers={"Authorization": f"Bearer {LLM_KEY}"}, timeout=25, json={
             "model": LLM_MODEL, "temperature": 0, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": SYSTEM},
                          {"role": "user", "content": f"Invoice {p['invoiceNumber']} {p['currency']} {p['amount']}"
@@ -608,7 +609,14 @@ async def rest_send(request: Request):
         body = json.loads(await request.body())
     except Exception:
         return err(400, "INVALID_JSON", "Body must be JSON")
-    t, e = await run_in_threadpool(send_message, principal, body)
+    try:
+        t, e = await run_in_threadpool(send_message, principal, body)
+    except Exception as ex:
+        import traceback
+        with db() as c:
+            c.execute("INSERT INTO log3 VALUES(?,?,?,?,?)", (time.time(), "EXC", "send", 500,
+                      json.dumps({"error": traceback.format_exc()[-1500:]})))
+        return err(500, "INTERNAL", f"Internal error: {ex!r}")
     return e if e else reply({"task": t})
 
 
@@ -673,4 +681,4 @@ def rest_cancel(request: Request, rest: str):
 @app.get("/a2a")
 @app.get("/a2a/")
 def root():
-    return JSONResponse({"ok": True, "version": 3, "agentCard": "/.well-known/agent-card.json", "a2aBase": BASE})
+    return JSONResponse({"ok": True, "version": 4, "agentCard": "/.well-known/agent-card.json", "a2aBase": BASE})
